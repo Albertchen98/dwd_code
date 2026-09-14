@@ -1,0 +1,5 @@
+# Overlay for the inherited Cosmos environment; GPU integration validation is pending.
+# DINOv3 and its processor are absent from the inherited Transformers 4.51.3 lock.
+transformers>=4.56.2,<5
+# Existing Cosmos-Reason caption embedding tool uses Ray.
+ray>=2.40,<3

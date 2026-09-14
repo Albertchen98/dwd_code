@@ -1,0 +1,818 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+from typing import Callable, Dict, Tuple
+
+import attrs
+import torch
+import torch.distributed.checkpoint as dcp
+import torch.nn as nn
+from einops import rearrange
+from megatron.core import parallel_state
+from torch import Tensor
+from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+from cosmos_transfer2._src.imaginaire.flags import INTERNAL
+from cosmos_transfer2._src.imaginaire.utils.easy_io import easy_io
+
+from cosmos_transfer2._src.imaginaire.checkpointer.s3_filesystem import S3StorageReader
+from cosmos_transfer2._src.imaginaire.lazy_config import LazyDict
+from cosmos_transfer2._src.imaginaire.utils import log, misc
+from cosmos_transfer2._src.predict2.checkpointer.dcp import ModelWrapper
+from cosmos_transfer2._src.predict2.conditioner import DataType
+from cosmos_transfer2._src.predict2.models.video2world_model_rectified_flow import (
+    NUM_CONDITIONAL_FRAMES_KEY,
+    Video2WorldModelRectifiedFlow,
+    Video2WorldModelRectifiedFlowConfig,
+)
+from cosmos_transfer2._src.transfer2.configs.vid2vid_transfer.defaults.conditioner import ControlVideo2WorldCondition
+from cosmos_transfer2._src.transfer2.datasets.augmentors.control_input import CTRL_HINT_KEYS
+from cosmos_transfer2._src.imaginaire.lazy_config import instantiate as lazy_instantiate
+from cosmos_transfer2._src.predict2.utils.context_parallel import broadcast, broadcast_split_tensor, cat_outputs_cp
+from dataclasses import replace
+from cosmos_transfer2._src.transfer2.datasets.data_sources.nuplan_dataset_images import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from torchvision.transforms.v2 import functional as F
+IS_PREPROCESSED_KEY = "is_preprocessed"
+
+@attrs.define(slots=False)
+class ControlDino2WorldRectifiedFlowConfig(Video2WorldModelRectifiedFlowConfig):
+    base_load_from: LazyDict = None
+    min_num_conditional_frames: int = 0  # Minimum number of latent conditional frames
+    max_num_conditional_frames: int = 2  # Maximum number of latent conditional frames
+    copy_weight_strategy: str = (
+        "first_n"  # How to copy weights from base model to control branch. "first_n" or "spaced_n"
+    )
+    hint_keys: str = "_".join([key.replace("control_input_", "") for key in CTRL_HINT_KEYS.keys()])
+    use_reference_image: bool = False  # Whether to use reference image as control input
+    sample_dino_key_frame: bool = True  # Whether to sample only key frames for dino control input
+    dinov3_encoder: LazyDict = None  # DINO V3 encoder configuration
+
+
+class ControlDino2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
+    """
+    ImaginaireModel instance of the VACE-styled controlnet for training.
+    """
+
+    def __init__(self, config: ControlDino2WorldRectifiedFlowConfig, *args, **kwargs):
+        self.is_new_training = True
+        self.copy_weight_strategy = config.copy_weight_strategy
+        # if config.get("hint_keys") is not None:
+        #     self.hint_keys = config.get("hint_keys") # srt: dino,anyup
+        #     self.hint_keys = self.hint_keys.split("_")
+        # else:
+        # self.hint_keys = ["anyup"]
+        self.hint_keys = ["control_input_dino"]
+        self.use_anyup_processed = config.get("use_anyup_processed", False)
+        self.anyup_inference_pca_channel = config.get("anyup_inference_pca_channel", None)
+        super().__init__(config, *args, **kwargs)
+        # Dino encoder
+        assert len(config.dinov3_encoder.out_layers) == 1 or config.net.use_dino_merge, "when use_dino_merge is False, dinov3_encoder.out_layers must be 1"
+        with misc.timer("DiffusionModel: set_up_dinov3_encoder"):
+            self.dinov3_encoder = lazy_instantiate(config.dinov3_encoder)
+            
+        log.info(self.net, rank0_only=True)
+
+    def get_data_and_condition(
+        self, data_batch: dict[str, torch.Tensor]
+    ) -> Tuple[Tensor, Tensor, ControlVideo2WorldCondition]:
+        # Get base data and condition
+        if self.input_data_key in data_batch and data_batch[self.input_data_key].shape[2] == 1:
+            data_batch[self.input_image_key] = data_batch[self.input_data_key].squeeze(2)
+            assert data_batch[self.input_image_key].dtype == torch.uint8, "Image data is not in uint8 format."
+            data_batch[self.input_image_key] = data_batch[self.input_image_key].to(**self.tensor_kwargs) / 127.5 - 1.0
+            del data_batch[self.input_data_key]
+        raw_state, latent_state, condition = super().get_data_and_condition(data_batch)
+        # Add control conditioning
+        latent_control_input = []
+        control_weight = data_batch.get("control_weight", [1.0] * len(self.hint_keys))
+        if len(control_weight) == 1:
+            control_weight = control_weight * len(self.hint_keys)
+        control_weight_maps = [None] * len(self.hint_keys)  # spatio-temporal control weight
+        for hi, hint_key in enumerate(self.hint_keys):
+            control_input = getattr(condition, hint_key, None)
+            # print(control_input.shape if control_input is not None else "None")
+            # print(hint_key)
+            control_input_mask = getattr(condition, hint_key + "_mask", None)
+            # 使用anyup推理
+            if self.anyup_inference_pca_channel:
+                anyup_B_T_C_H_W = data_batch["anyup"]
+                anyup_B_C_T_H_W = anyup_B_T_C_H_W.permute(0, 2, 1, 3, 4)
+                # 取前几个pca的值
+                anyup_B_C_T_H_W = anyup_B_C_T_H_W[:, :self.anyup_inference_pca_channel]
+                # 采样kframe
+                anyup_B_C_T_H_W = anyup_B_C_T_H_W[:,:,::4]
+                latent_control_input = [anyup_B_C_T_H_W.to(**self.tensor_kwargs)]  # B C T H W           
+            else:
+                latent_control_input += self.get_control_latent(latent_state, control_input, control_input_mask)
+            if not torch.is_grad_enabled() and not self.net.vace_has_mask:  # inference mode
+                if control_input is None:  # set control weight to 0 if no control input
+                    if len(control_weight) == len(self.hint_keys):
+                        control_weight[hi] = 0.0
+                    else:
+                        control_weight.insert(hi, 0.0)
+                if (
+                    control_input_mask is not None and (control_input_mask != 1).any()
+                ):  # use control weight to implement masking operation
+                    assert control_input_mask.shape[1] == 1, (
+                        f"control_input_mask.shape[1] != 1: {control_input_mask.shape[1]}"
+                    )
+                    control_weight_maps[hi] = control_input_mask * control_weight[hi]
+        # If any control mask exists, use spatio-temporal control weight instead of scalar control weight.
+        if any(c is not None for c in control_weight_maps):
+            for hi in range(len(self.hint_keys)):
+                if control_weight_maps[hi] is None:  # convert scalar control weight to spatio-temporal control weight
+                    control_weight_maps[hi] = control_weight[hi] * torch.ones_like(
+                        next(c for c in control_weight_maps if c is not None)
+                    )
+            control_weight_maps = torch.stack(control_weight_maps)
+            # resize spatio-temporal control weight to match latent_state shape
+            control_weight = self.resize_control_weight(control_weight_maps, latent_state)
+
+        # assert num_modalities > 0, "No control input found"
+        latent_control_input = torch.cat(latent_control_input, dim=1)
+        condition = condition.set_control_condition(
+            latent_control_input=latent_control_input,
+            control_weight=control_weight,
+        )
+
+        return raw_state, latent_state, condition    
+
+    def resize_control_weight(self, control_context_scale: Tensor, latent_state: Tensor) -> Tensor:
+        temporal_compression_factor = self.tokenizer.temporal_compression_factor
+        control_weight_maps = [w for w in control_context_scale]  # Keep as tensor
+        _, _, T, H, W = latent_state.shape
+        H = H // self.net.patch_spatial  # spatial patch size
+        W = W // self.net.patch_spatial  # spatial patch size
+        weight_maps = []
+        for weight_map in control_weight_maps:  # [B, 1, T, H, W]
+            if weight_map.shape[2:5] != (T, H, W):
+                assert weight_map.shape[2] == temporal_compression_factor * (T - 1) + 1, (
+                    f"{weight_map.shape[2]} != {temporal_compression_factor * (T - 1) + 1}"
+                )
+                weight_map_i = [
+                    torch.nn.functional.interpolate(
+                        weight_map[:, :, :1, :, :],
+                        size=(1, H, W),
+                        mode="trilinear",
+                        align_corners=False,
+                    )
+                ]
+                weight_map_i += [
+                    torch.nn.functional.interpolate(
+                        weight_map[:, :, 1:],
+                        size=(T - 1, H, W),
+                        mode="trilinear",
+                        align_corners=False,
+                    )
+                ]
+                weight_map = torch.cat(weight_map_i, dim=2)
+
+            # Reshape to match BTHWD format
+            weight_map = weight_map.permute(0, 2, 3, 4, 1)  # [B, T, H, W, 1]
+            weight_maps.append(weight_map)
+        control_weight_maps = weight_maps
+        control_weight_maps = torch.stack(control_weight_maps)
+        # Cap the sum over dim0 at each T,H,W position to be at most 1.0
+        # control_weight_maps shape: [num_modalities, B, T, H, W, 1]
+        max_control_weight_sum = 1.0
+        sum_over_modalities = control_weight_maps.sum(dim=0)  # [B, T, H, W, 1]
+        max_values = torch.clamp_min(sum_over_modalities, max_control_weight_sum)  # [B, T, H, W, 1]
+        scale_factors = max_control_weight_sum / max_values  # [B, T, H, W, 1]
+        control_weight_maps = control_weight_maps * scale_factors[None]  # [num_modalities, B, T, H, W, 1]
+        return control_weight_maps
+
+    def get_control_latent(self, latent_state: Tensor, control_input: Tensor, control_input_mask: Tensor) -> Tensor:
+        # even it's named as latent_control_input, they are still rgb frames, do nothing just sampling
+        latent_control_input = []
+        if self.config.sample_dino_key_frame:
+            
+            # control_input = self.dinov3_encoder(control_input[:,:,::4].to(**self.tensor_kwargs))
+            latent_control_input.append(control_input[:,:,::4].to(**self.tensor_kwargs))
+            # latent_control_input.append(self.dinov3_encoder(control_input[:,:,::4].to(**self.tensor_kwargs)))
+            # print(f"latent_control_input has shape {latent_control_input[0].shape}")
+        else:
+            # assert NotImplementedError
+            control_input = torch.nn.functional.pad(control_input, (0, 0, 0, 0, 3, 0), "constant", 0)
+            # state_t = self.get_num_video_latent_frames()
+            # control_input = rearrange(control_input, "b c (t r) h w -> b (r c) t h w", t=state_t)
+            latent_control_input.append(control_input.to(**self.tensor_kwargs))
+        return latent_control_input
+    
+    def training_step(
+        self, data_batch: dict[str, torch.Tensor], iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """
+        Performs a single training step for the diffusion model.
+
+        This method is responsible for executing one iteration of the model's training. It involves:
+        1. Adding noise to the input data using the SDE process.
+        2. Passing the noisy data through the network to generate predictions.
+        3. Computing the loss based on the difference between the predictions and the original data, \
+            considering any configured loss weighting.
+
+        Args:
+            data_batch (dict): raw data batch draw from the training data loader.
+            iteration (int): Current iteration number.
+
+        Returns:
+            tuple: A tuple containing two elements:
+                - dict: additional data that used to debug / logging / callbacks
+                - Tensor: The computed loss for the training step as a PyTorch Tensor.
+
+        Raises:
+            AssertionError: If the class is conditional, \
+                but no number of classes is specified in the network configuration.
+
+        Notes:
+            - The method handles different types of conditioning
+            - The method also supports Kendall's loss
+        """
+        self._update_train_stats(data_batch)
+
+        # Obtain text embeddings online
+        if self.config.text_encoder_config is not None and self.config.text_encoder_config.compute_online:
+            text_embeddings = self.text_encoder.compute_text_embeddings_online(data_batch, self.input_caption_key)
+            data_batch["t5_text_embeddings"] = text_embeddings
+            data_batch["t5_text_mask"] = torch.ones(text_embeddings.shape[0], text_embeddings.shape[1], device="cuda")
+
+        # Get the input data to noise and denoise~(image, video) and the corresponding conditioner.
+        _, x0_B_C_T_H_W, condition = self.get_data_and_condition(data_batch)
+        
+        #TODO change this to not hardcoded
+        if not self.config.sample_dino_key_frame and self.get_context_parallel_group() is not None:
+            num_frames = condition.latent_control_input.shape[2]
+            control_padding_mask = torch.ones([1,1,num_frames,1,1], device=condition.latent_control_input.device, 
+                                              dtype=condition.latent_control_input.dtype) # inversed mask
+            control_padding_mask[:, :, :3] = 0
+            cp_group = self.get_context_parallel_group()
+            control_padding_mask = broadcast_split_tensor(control_padding_mask, seq_dim=2, process_group=cp_group)
+
+        # Sample pertubation noise levels and N(0, 1) noises
+        epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), **self.tensor_kwargs_fp32)
+        batch_size = x0_B_C_T_H_W.size()[0]
+        t_B = self.rectified_flow.sample_train_time(batch_size).to(**self.tensor_kwargs_fp32)
+        t_B = rearrange(t_B, "b -> b 1")  # add a dimension for T, all frames share the same sigma
+
+        x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, t_B = self.broadcast_split_for_model_parallelsim(
+            x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, t_B
+        )
+        if not self.use_anyup_processed:
+            with torch.no_grad():
+                # log.info(f"condition.latent_control_input has shape: {condition.latent_control_input.shape}")
+                # log.info(f"condition.latent_control_input has range from {condition.latent_control_input.min()} to {condition.latent_control_input.max()}")
+                # _latent_control_input = condition.latent_control_input / 255.0
+                # B, _, _, _, _ = _latent_control_input.shape
+                # _latent_control_input = rearrange(_latent_control_input, "B C T H W -> (B T) C H W")
+                # _latent_control_input = F.normalize(
+                #                     _latent_control_input, 
+                #                     mean=IMAGENET_DEFAULT_MEAN, 
+                #                     std=IMAGENET_DEFAULT_STD
+                #                 )
+                # _latent_control_input = rearrange(_latent_control_input, "(B T) C H W -> B C T H W", B=B)
+                _latent_control_input = self.dinov3_encoder(condition.latent_control_input)
+            
+            if not self.config.sample_dino_key_frame:
+                _latent_control_input = _latent_control_input * control_padding_mask
+                _latent_control_input = rearrange(_latent_control_input, "b c (t r) h w -> b (r c) t h w", r=4)
+                
+            condition = replace(condition, latent_control_input=_latent_control_input.clone().detach())
+
+        timesteps = self.rectified_flow.get_discrete_timestamp(t_B, self.tensor_kwargs_fp32)
+
+        if self.config.use_high_sigma_strategy:
+            # Use high sigma strategy
+            mask = torch.rand(timesteps.shape, device=timesteps.device) < self.config.high_sigma_ratio
+
+            candidate_timesteps = self.rectified_flow.noise_scheduler.timesteps.to(device=timesteps.device)
+            candidate_timesteps = candidate_timesteps[
+                (candidate_timesteps >= self.config.high_sigma_timesteps_min)
+                & (candidate_timesteps <= self.config.high_sigma_timesteps_max)
+            ]
+
+            if len(candidate_timesteps) > 0:
+                # Sample timesteps.shape values from candidate_timesteps with replacement
+                new_timesteps = candidate_timesteps[torch.randint(0, len(candidate_timesteps), timesteps.shape)]
+                timesteps = torch.where(mask, new_timesteps, timesteps)
+            else:
+                raise ValueError("No candidate timesteps found for high sigma strategy")
+
+        sigmas = self.rectified_flow.get_sigmas(
+            timesteps,
+            self.tensor_kwargs_fp32,
+        )
+
+        timesteps = rearrange(timesteps, "b -> b 1")
+        sigmas = rearrange(sigmas, "b -> b 1")
+        xt_B_C_T_H_W, vt_B_C_T_H_W = self.rectified_flow.get_interpolation(epsilon_B_C_T_H_W, x0_B_C_T_H_W, sigmas)
+
+        vt_pred_B_C_T_H_W = self.denoise(
+            noise=epsilon_B_C_T_H_W,
+            xt_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),
+            timesteps_B_T=timesteps,
+            condition=condition,
+        )
+
+        time_weights_B = self.rectified_flow.train_time_weight(timesteps, self.tensor_kwargs_fp32)
+        per_instance_loss = torch.mean(
+            (vt_pred_B_C_T_H_W - vt_B_C_T_H_W) ** 2, dim=list(range(1, vt_pred_B_C_T_H_W.dim()))
+        )
+
+        loss = torch.mean(time_weights_B * per_instance_loss)
+        output_batch = {
+            "x0": x0_B_C_T_H_W,
+            "xt": xt_B_C_T_H_W,
+            "sigma": sigmas,
+            "condition": condition,
+            "model_pred": vt_pred_B_C_T_H_W,
+            "edm_loss": loss,
+        }
+
+        return output_batch, loss
+    
+    def denoise(self, noise: torch.Tensor, xt_B_C_T_H_W: torch.Tensor, timesteps_B_T: torch.Tensor, condition):
+        """
+        Override denoise method for control branch support in rectified flow.
+        """
+        # Handle control conditioning
+        if hasattr(condition, "latent_control_input"):
+            # The control conditioning is already set in the condition object
+            pass
+
+        # Call parent's denoise method
+        return super().denoise(noise, xt_B_C_T_H_W, timesteps_B_T, condition)
+
+    def get_velocity_fn_from_batch(
+        self,
+        data_batch: Dict,
+        guidance: float = 1.5,
+        is_negative_prompt: bool = False,
+    ) -> Callable:
+        """
+        Generates a callable function `velocity_fn` based on the provided data batch and guidance factor for rectified flow.
+        """
+
+        if NUM_CONDITIONAL_FRAMES_KEY in data_batch:
+            num_conditional_frames = data_batch[NUM_CONDITIONAL_FRAMES_KEY]
+            log.info(
+                f"num_conditional_frames: {num_conditional_frames} is set by data_batch[NUM_CONDITIONAL_FRAMES_KEY]"
+            )
+        else:
+            num_conditional_frames = 0
+
+        if is_negative_prompt:
+            condition, uncondition = self.conditioner.get_condition_with_negative_prompt(data_batch)
+        else:
+            condition, uncondition = self.conditioner.get_condition_uncondition(data_batch)
+
+        is_image_batch = self.is_image_batch(data_batch)
+        condition = condition.edit_data_type(DataType.IMAGE if is_image_batch else DataType.VIDEO)
+        uncondition = uncondition.edit_data_type(DataType.IMAGE if is_image_batch else DataType.VIDEO)
+        _, x0, control_condition = self.get_data_and_condition(data_batch)
+
+        # Set video condition
+        condition = condition.set_video_condition(
+            gt_frames=x0,
+            random_min_num_conditional_frames=self.config.min_num_conditional_frames,
+            random_max_num_conditional_frames=self.config.max_num_conditional_frames,
+            num_conditional_frames=num_conditional_frames,
+        )
+        uncondition = uncondition.set_video_condition(
+            gt_frames=x0,
+            random_min_num_conditional_frames=self.config.min_num_conditional_frames,
+            random_max_num_conditional_frames=self.config.max_num_conditional_frames,
+            num_conditional_frames=num_conditional_frames,
+        )
+
+        # Set control condition
+        latent_control_input = control_condition.latent_control_input
+            # condition = replace(condition, control_input_dino=_latent_control_input)
+        
+        #TODO change this to not hardcoded
+        if not self.config.sample_dino_key_frame and self.get_context_parallel_group() is not None:
+            num_frames = latent_control_input.shape[2]
+            control_padding_mask = torch.ones([1,1,num_frames,1,1], device=latent_control_input.device, dtype=latent_control_input.dtype) # inversed mask
+            control_padding_mask[:, :, :3] = 0
+            cp_group = self.get_context_parallel_group()
+            control_padding_mask = broadcast_split_tensor(control_padding_mask, seq_dim=2, process_group=cp_group)
+            
+        
+        control_weight = control_condition.control_context_scale
+        condition = condition.set_control_condition(
+            latent_control_input=latent_control_input, control_weight=control_weight
+        )
+        uncondition = uncondition.set_control_condition(
+            latent_control_input=latent_control_input, control_weight=control_weight
+        )
+        _, condition, _, _ = self.broadcast_split_for_model_parallelsim(x0, condition, None, None)
+        _, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, uncondition, None, None)
+        
+        if not self.use_anyup_processed:
+            with torch.no_grad():
+                log.info(f"condition.latent_control_input has shape: {condition.latent_control_input.shape}")
+                log.info(f"condition.latent_control_input has range from {condition.latent_control_input.min()} to {condition.latent_control_input.max()}")
+                # latent_control_input is in the range of 0-255 
+                # _latent_control_input = condition.latent_control_input / 255.0
+                # B, _, _, _, _ = _latent_control_input.shape
+                # _latent_control_input = rearrange(_latent_control_input, "B C T H W -> (B T) C H W")
+                # _latent_control_input = F.normalize(
+                #                     _latent_control_input, 
+                #                     mean=IMAGENET_DEFAULT_MEAN, 
+                #                     std=IMAGENET_DEFAULT_STD
+                #                 )
+                # _latent_control_input = rearrange(_latent_control_input, "(B T) C H W -> B C T H W", B=B)
+                _latent_control_input = self.dinov3_encoder(condition.latent_control_input)
+        
+            if not self.config.sample_dino_key_frame:
+                _latent_control_input = _latent_control_input * control_padding_mask
+                _latent_control_input = rearrange(_latent_control_input, "b c (t r) h w -> b (r c) t h w", r=4)
+            
+            log.info(f"_latent_control_input has shape: {_latent_control_input.shape}")
+            condition = replace(condition, latent_control_input=_latent_control_input)
+            uncondition = replace(uncondition, latent_control_input=_latent_control_input)
+            log.info(f"after dino encoder, condition.latent_control_input has shape: {condition.latent_control_input.shape}")
+            log.info(f"after dino encoder, uncondition.latent_control_input has shape: {uncondition.latent_control_input.shape}")
+
+        # debug
+        # from cosmos_transfer2._src.predict2.utils.context_parallel import broadcast, broadcast_split_tensor, cat_outputs_cp
+        # from cosmos_transfer2._src.imaginaire.utils import callback, distributed
+        # from safetensors.torch import save_file
+        # # if from cosmos_transfer2._src.imaginaire.utils import callback, distributed:
+        # cp_group = self.get_context_parallel_group()
+        # latent_control_input_to_save = cat_outputs_cp(condition.latent_control_input, seq_dim=2, cp_group=cp_group)
+        # if distributed.is_rank0:
+        #     save_file({'latent_control_input': latent_control_input_to_save.cpu()}, 'debug_latent_control_input.safetensors')
+        # breakpoint()
+        
+        if parallel_state.is_initialized():
+            pass
+        else:
+            assert not self.net.is_context_parallel_enabled, (
+                "parallel_state is not initialized, context parallel should be turned off."
+            )
+
+        def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+            noise_x = noise_x.to(**self.tensor_kwargs)
+            cond_v = self.denoise(noise, noise_x, timestep, condition)
+            uncond_v = self.denoise(noise, noise_x, timestep, uncondition)
+            velocity_pred = cond_v + guidance * (cond_v - uncond_v)
+            return velocity_pred
+
+        return velocity_fn
+
+    def _normalize_video_databatch_inplace(self, data_batch: dict[str, Tensor], input_key: str | None = None) -> None:
+        """
+        Normalizes video data in-place on a CUDA device to reduce data loading overhead.
+
+        This function modifies the video data tensor within the provided data_batch dictionary
+        in-place, scaling the uint8 data from the range [0, 255] to the normalized range [-1, 1].
+
+        Warning:
+            A warning is issued if the data has not been previously normalized.
+
+        Args:
+            data_batch (dict[str, Tensor]): A dictionary containing the video data under a specific key.
+                This tensor is expected to be on a CUDA device and have dtype of torch.uint8.
+
+        Side Effects:
+            Modifies the 'input_data_key' tensor within the 'data_batch' dictionary in-place.
+
+        Note:
+            This operation is performed directly on the CUDA device to avoid the overhead associated
+            with moving data to/from the GPU. Ensure that the tensor is already on the appropriate device
+            and has the correct dtype (torch.uint8) to avoid unexpected behaviors.
+        """
+        super()._normalize_video_databatch_inplace(data_batch, input_key)
+
+        # Handle control_input if it exists
+        for key in data_batch.keys():
+            if "dino" in key:
+                # log.info(f"skipping normalizing {key}")
+                continue
+            if key.startswith("control_input_") and data_batch[key] is not None:
+                hint_key = key
+                # Normalize control_input if not already normalized
+                # log.info(f"normalizing {hint_key} in-place")
+                if data_batch[hint_key].dtype == torch.uint8:
+                    data_batch[hint_key] = data_batch[hint_key].to(**self.tensor_kwargs) / 127.5 - 1.0
+                elif data_batch[hint_key].dtype == torch.bool:
+                    data_batch[hint_key] = data_batch[hint_key].to(**self.tensor_kwargs)
+
+                if data_batch[hint_key].dim() == 5 and data_batch[hint_key].shape[2] > 1:
+                    expected_length = self.tokenizer.get_pixel_num_frames(self.config.state_t)
+                    original_length = data_batch[hint_key].shape[2]
+                    assert original_length == expected_length, (
+                        "Input control_input length doesn't match expected length specified by state_t."
+                    )
+
+    def _augment_image_dim_inplace(self, data_batch: dict[str, Tensor], input_key: str = None) -> None:
+        super()._augment_image_dim_inplace(data_batch, input_key)
+        # Handle control_input if it exists
+        for key in data_batch.keys():
+            if key.startswith("control_input_") and data_batch[key] is not None and data_batch[key].dim() == 4:
+                data_batch[key] = rearrange(data_batch[key], "b c h w -> b c 1 h w").contiguous()
+
+    def copy_weights_to_control_branch(self) -> None:
+        """
+        VACE has the skip design of control blocks: control block i output modulates base block 2i
+        In ControlNet training beginning, we copy base model weights to control branch. There are two strategies:
+        1. copy base model's i-th block weight to control net's i-th block (more intuitive, the control blocks is a trainable
+         copy of the first N layers of the base model)
+        2. copy base model's 2i-th block weight to control net's i-th block (follow the correspondence of skip connection, \
+           but the block-to-block connection in the control branch is weird.)
+        Here we adopt the first strategy.
+        """
+        if self.is_new_training:
+            control_blocks = (
+                self.net.control_blocks if self.net.num_control_branches == 1 else self.net.control_blocks_0
+            )
+            if self.copy_weight_strategy == "first_n":
+                # copy base model's i-th block weight to control net's i-th block
+                control_to_base_layer_maping = {i: i for i in range(len(control_blocks))}
+                assert len(control_to_base_layer_maping) == len(control_blocks)
+            elif self.copy_weight_strategy == "spaced_n":
+                # copy base model's 2i-th block weight to control net's i-th block
+                control_to_base_layer_maping = {v: k for k, v in self.net.control_layers_mapping.items()}
+                assert len(control_to_base_layer_maping) == len(control_blocks)
+            else:
+                raise ValueError("Other copy weight strategy doesn't seem to make sense.")
+
+            # 1. First copy weights from base model to control net
+            for control_layer_idx, base_layer_idx in control_to_base_layer_maping.items():
+                log.info(
+                    f"======Copying base model's {base_layer_idx}-th block weight to control net's {control_layer_idx}-th block"
+                )
+
+                if self.net.num_control_branches > 1:
+                    for nc in range(self.net.num_control_branches):
+                        missing_keys, unexpected_keys = getattr(self.net, f"control_blocks_{nc}")[
+                            control_layer_idx
+                        ].load_state_dict(self.net.blocks[base_layer_idx].state_dict(), strict=False)
+                else:
+                    missing_keys, unexpected_keys = self.net.control_blocks[control_layer_idx].load_state_dict(
+                        self.net.blocks[base_layer_idx].state_dict(), strict=False
+                    )
+                assert len(unexpected_keys) == 0, f"unexpected_keys: {unexpected_keys}"
+                assert set(missing_keys).issubset(
+                    {
+                        "before_proj.weight",
+                        "before_proj.bias",
+                        "after_proj.weight",
+                        "after_proj.bias",
+                        "_checkpoint_wrapped_module.before_proj.weight",
+                        "_checkpoint_wrapped_module.before_proj.bias",
+                        "_checkpoint_wrapped_module.after_proj.weight",
+                        "_checkpoint_wrapped_module.after_proj.bias",
+                    }
+                ), f"missing_keys: {missing_keys}"
+
+            if self.net.separate_embedders:
+                self.net.t_embedder_for_control_branch.load_state_dict(self.net.t_embedder.state_dict(), strict=True)
+                self.net.t_embedding_norm_for_control_branch.load_state_dict(
+                    self.net.t_embedding_norm.state_dict(), strict=True
+                )
+                self.net.x_embedder_for_control_branch.load_state_dict(self.net.x_embedder.state_dict(), strict=True)
+
+            self.is_new_training = False
+
+    def freeze_base_model(self):
+        log.info("\nFreezing base model\n")
+        # 1. freeze everything
+        for param in self.net.parameters():
+            param.requires_grad = False
+
+        # 2. unfreeze control-specific parameters: the blocks and patch embedding
+        if self.net.num_control_branches > 1:
+            for nc in range(self.net.num_control_branches):
+                for param in getattr(self.net, f"control_blocks_{nc}").parameters():
+                    param.requires_grad = True
+            if hasattr(self.net, "after_proj"):
+                for param in self.net.after_proj.parameters():
+                    param.requires_grad = True
+        else:
+            for block in self.net.control_blocks:
+                for param in block.parameters():
+                    param.requires_grad = True
+
+        for param in self.net.control_embedder.parameters():
+            param.requires_grad = True
+        
+        if self.net.dinov3_mergehead is not None:
+            for param in self.net.dinov3_mergehead.parameters():
+                param.requires_grad = True
+
+        if self.net.separate_embedders:
+            for param in self.net.t_embedder_for_control_branch.parameters():
+                param.requires_grad = True
+            for param in self.net.t_embedding_norm_for_control_branch.parameters():
+                param.requires_grad = True
+            for param in self.net.x_embedder_for_control_branch.parameters():
+                param.requires_grad = True
+
+        if self.net.use_input_hint_block:
+            for param in self.net.input_hint_block.parameters():
+                param.requires_grad = True
+
+        # 3. unfreeze reference image weights if we use reference image control
+        if self.config.use_reference_image:
+            if hasattr(self.net, "img_context_proj"):
+                for param in self.net.img_context_proj.parameters():
+                    param.requires_grad = True
+                log.info("✓ Unfroze img_context_proj")
+
+            # 3.1 Unfreeze reference image weights in each ControlAwareDiTBlock
+            if hasattr(self.net, "blocks"):
+                for i, block in enumerate(self.net.blocks):
+                    # Access the actual block inside CheckpointWrapper
+                    actual_block = block._checkpoint_wrapped_module
+                    cross_attn = actual_block.cross_attn
+
+                    # Unfreeze k_img, v_img, k_img_norm
+                    for param_key in ["k_img", "v_img", "k_img_norm", "q_img", "q_img_norm"]:
+                        if hasattr(cross_attn, param_key):
+                            for param in getattr(cross_attn, param_key).parameters():
+                                param.requires_grad = True
+
+                    log.info(f"✓ Unfroze reference image weights in ControlAwareDiTBlock {i}")
+
+            # 3.2 Unfreeze reference image weights in each ControlEncoderDiTBlock
+            if hasattr(self.net, "control_blocks"):
+                for i, block in enumerate(self.net.control_blocks):
+                    # Access the actual block inside CheckpointWrapper
+                    actual_block = block._checkpoint_wrapped_module
+                    cross_attn = actual_block.cross_attn
+
+                    # Unfreeze k_img, v_img, k_img_norm
+                    for param_key in ["k_img", "v_img", "k_img_norm", "q_img", "q_img_norm"]:
+                        if hasattr(cross_attn, param_key):
+                            for param in getattr(cross_attn, param_key).parameters():
+                                param.requires_grad = True
+
+                    log.info(f"✓ Unfroze reference image weights in ControlEncoderDiTBlock {i}")
+
+    def set_up_model(self):
+        super().set_up_model()
+        self.freeze_base_model()
+        self.load_base_model()
+        self.copy_weights_to_control_branch()
+
+    def load_multi_branch_checkpoints(self, checkpoint_paths: list[str]):
+        """
+        Load control blocks from multiple checkpoint paths into control_blocks_0, control_blocks_1, etc.
+
+        Args:
+            checkpoint_paths (list[str]): List of checkpoint paths containing control blocks
+        """
+        if not checkpoint_paths:
+            log.warning("No checkpoint paths provided for control branches")
+            return
+
+        # Use the same credentials as base model if available
+        credential_path = "credentials/s3_checkpoint.secret"
+        if hasattr(self.config, "base_load_from") and self.config.base_load_from is not None:
+            credential_path = self.config.base_load_from.credentials
+
+        load_planner = DefaultLoadPlanner(allow_partial_load=False)
+        _model_wrapper = ModelWrapper(self)
+        _state_dict = _model_wrapper.state_dict()
+
+        # Filter out _extra_state entries to avoid metadata mismatch
+        checkpoint_state_dict = {k: v for k, v in _state_dict.items() if "_extra_state" not in k}
+        # Replace control_blocks_{nc} with control_blocks in the state dict
+        for k in list(checkpoint_state_dict.keys()):
+            for nc in range(self.net.num_control_branches):
+                if f"control_blocks_{nc}" in k:
+                    new_key = k.replace(f"control_blocks_{nc}", "control_blocks")
+                    checkpoint_state_dict[new_key] = checkpoint_state_dict.pop(k)
+                elif f"control_embedder.{nc}" in k:
+                    new_key = k.replace(f"control_embedder.{nc}", "control_embedder")
+                    checkpoint_state_dict[new_key] = checkpoint_state_dict.pop(k)
+
+        for nc, checkpoint_path in enumerate(checkpoint_paths):
+            if checkpoint_path is None:
+                log.warning(f"No checkpoint path provided for control branch {nc}")
+                continue
+
+            checkpoint_format = "pt" if checkpoint_path.endswith(".pt") else "dcp"
+            # Handle checkpoint path with or without "model" suffix
+            cur_key_ckpt_full_path = (
+                checkpoint_path
+                if checkpoint_path.endswith("model") or checkpoint_format == "pt"
+                else os.path.join(checkpoint_path, "model")
+            )
+            log.critical(f"Start loading checkpoint for control branch {nc} from {checkpoint_path}")
+
+            if "s3://" in checkpoint_path:
+                storage_reader = S3StorageReader(
+                    credential_path=credential_path,
+                    path=cur_key_ckpt_full_path,
+                )
+            else:
+                storage_reader = FileSystemReader(cur_key_ckpt_full_path)
+
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+            if checkpoint_format == "dcp":  # load dcp checkpoint
+                dcp.load(
+                    checkpoint_state_dict,
+                    storage_reader=storage_reader,
+                    planner=load_planner,
+                )
+            else:
+                # load pytorch checkpoint appending all keys to checkpoint_to_model_keys
+                checkpoint_state_dict = torch.load(checkpoint_path)
+
+            # Create mapping from checkpoint keys to model keys
+            # Checkpoint has "control_blocks" but we want to load into "control_blocks_{nc}"
+            checkpoint_to_model_keys = {}
+            for k, v in checkpoint_state_dict.items():
+                if "control_blocks." in k:
+                    # Replace "control_blocks" with "control_blocks_{nc}" in the key
+                    new_key = k.replace("control_blocks", f"control_blocks_{nc}")
+                    checkpoint_to_model_keys[new_key] = v
+                elif "control_embedder" in k:
+                    new_key = k.replace("control_embedder", f"control_embedder.{nc}")
+                    checkpoint_to_model_keys[new_key] = v
+                else:
+                    checkpoint_to_model_keys[k] = v
+
+            assert checkpoint_to_model_keys, f"No control_blocks keys found in checkpoint for branch {nc}"
+
+            log.info(f"Checkpoint to model keys: {checkpoint_to_model_keys}")
+            _model_wrapper.load_state_dict(checkpoint_to_model_keys)
+            log.info(f"Done loading the control branch {nc} checkpoint.")
+
+    def load_base_model(self) -> None:
+        config = self.config
+        if config.base_load_from is not None:
+            checkpoint_path = config.base_load_from["load_path"]
+        else:
+            checkpoint_path = None
+        # breakpoint()
+        if checkpoint_path is not None:
+            load_planner = DefaultLoadPlanner(allow_partial_load=True)
+            if config.base_load_from.get("credentials", None):
+                cur_key_ckpt_full_path = os.path.join("s3://", checkpoint_path, "model")
+                if INTERNAL:
+                    storage_reader = S3StorageReader(
+                        credential_path=config.base_load_from.credentials,
+                        path=cur_key_ckpt_full_path,
+                    )
+                else:
+                    from cosmos_transfer2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
+
+                    checkpoint_path = get_checkpoint_path(cur_key_ckpt_full_path)
+            else:
+                storage_reader = FileSystemReader(checkpoint_path)
+
+            log.critical(f"Start loading checkpoint for base model from {checkpoint_path}")
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+            _model_wrapper = ModelWrapper(self)
+            _state_dict = _model_wrapper.state_dict()
+
+            # Filter out _extra_state entries to avoid metadata mismatch
+            filtered_state_dict = {k: v for k, v in _state_dict.items() if "_extra_state" not in k}
+
+            # Copy EMA weights to regular weights
+            all_keys = list(filtered_state_dict.keys())
+            # log.info(f"All keys: {all_keys}")
+            for k in all_keys:
+                if k.startswith("net.") and k.replace("net.", "net_ema.") in filtered_state_dict:
+                    filtered_state_dict[k] = filtered_state_dict[k.replace("net.", "net_ema.")]
+            self.load_state_dict(easy_io.load(checkpoint_path), strict=False)
+        log.info("Done loading the base model checkpoint.")
+
+    def get_x_from_clean(
+        self,
+        in_clean_img: torch.Tensor,
+        sigma_max: float | None,
+        seed: int = 1,
+    ) -> Tensor:
+        """
+        in_clean_img (torch.Tensor): input clean image for image-to-image/video-to-video by adding noise then denoising
+        sigma_max (float): maximum sigma applied to in_clean_image for image-to-image/video-to-video
+        """
+        if in_clean_img is None:
+            return None
+        generator = torch.Generator(device=self.tensor_kwargs["device"])
+        generator.manual_seed(seed)
+        noise = torch.randn(*in_clean_img.shape, **self.tensor_kwargs, generator=generator)
+        if sigma_max is None:
+            sigma_max = self.sde.sigma_max
+        x_sigma_max = in_clean_img * (1-sigma_max) + noise * sigma_max
+        return x_sigma_max
