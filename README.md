@@ -7,6 +7,8 @@
   <a href="https://albertchen98.github.io/DwD-project/"><img src="https://img.shields.io/badge/Project-Page-2563EB?logo=github&amp;logoColor=white" alt="Project page"></a>
 </p>
 
+> **Note:** This code was reconstructed separately and has not yet been validated through end-to-end training, as I currently do not have access to a GPU cluster. If you have any questions or encounter issues, please [open an issue](https://github.com/Albertchen98/dwd_code/issues). I'll do my best to respond promptly.
+
 Transform simulated driving videos into realistic videos using DINOv3 features as conditioning. This repository provides training, data preprocessing, and inference code built on [NVIDIA Cosmos-Transfer2.5](https://github.com/nvidia-cosmos/cosmos-transfer2.5), with Cosmos-Predict2.5-2B as the generative backbone.
 
 ![Driving with DINO teaser](figures/teaser_figurev4.png)
