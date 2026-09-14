@@ -1,8 +1,13 @@
-# Driving with DINO (DwD)
+<h1 align="center">Driving with DINO: Vision Foundation Features as a Unified Bridge for Sim-to-Real Generation in Autonomous Driving</h1>
+
+<p align="center"><strong>Accepted to ACM MM 2026</strong></p>
+
+<p align="center">
+  <a href="https://arxiv.org/abs/2602.06159"><img src="https://img.shields.io/badge/arXiv-2602.06159-B31B1B?logo=arxiv&amp;logoColor=white" alt="arXiv paper"></a>
+  <a href="https://albertchen98.github.io/DwD-project/"><img src="https://img.shields.io/badge/Project-Page-2563EB?logo=github&amp;logoColor=white" alt="Project page"></a>
+</p>
 
 Transform simulated driving videos into realistic videos using DINOv3 features as conditioning. This repository provides training, data preprocessing, and inference code built on [NVIDIA Cosmos-Transfer2.5](https://github.com/nvidia-cosmos/cosmos-transfer2.5), with Cosmos-Predict2.5-2B as the generative backbone.
-
-[Paper](https://arxiv.org/abs/2602.06159) · [Project Page](https://albertchen98.github.io/DwD-project/)
 
 ![Driving with DINO teaser](figures/teaser_figurev4.png)
 
