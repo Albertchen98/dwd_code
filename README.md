@@ -7,7 +7,7 @@
   <a href="https://albertchen98.github.io/DwD-project/"><img src="https://img.shields.io/badge/Project-Page-2563EB?logo=github&amp;logoColor=white" alt="Project page"></a>
 </p>
 
-> **Note:** This code was reconstructed separately and has not yet been validated through end-to-end training, as I currently do not have access to a GPU cluster. If you have any questions or encounter issues, please [open an issue](https://github.com/Albertchen98/dwd_code/issues). I'll do my best to respond promptly.
+> **Note:** This code has not yet been validated through end-to-end training, as I currently do not have access to a GPU cluster. If you have any questions or encounter issues, please [open an issue](https://github.com/Albertchen98/dwd_code/issues). I'll do my best to respond promptly.
 
 Transform simulated driving videos into realistic videos using DINOv3 features as conditioning. This repository provides training, data preprocessing, and inference code built on [NVIDIA Cosmos-Transfer2.5](https://github.com/nvidia-cosmos/cosmos-transfer2.5), with Cosmos-Predict2.5-2B as the generative backbone.
 
@@ -31,9 +31,9 @@ Transform simulated driving videos into realistic videos using DINOv3 features a
 | Training mode | Offline DINO features; online extraction is optional |
 | Resources and schedule | Single node with 8 GPUs, 10,000 iterations, checkpoint every 1,000 iterations |
 
-**The ×4 scaling applies only to the DINO encoder input; it does not change the generated video resolution.** The original DINOv3 LayerNorm and its learnable parameters are preserved, and the old `NORMALIZE_DINO` switch has been removed. ImageNet image normalization is still required. Feature L2 normalization is disabled by default.
+**The ×4 scaling applies only to the DINO encoder input; it does not change the generated video resolution.** DINOv3 uses its pretrained LayerNorm, including the learned scale and bias. Input images use ImageNet normalization. Feature L2 normalization is disabled by default.
 
-The temporal convolutions retain symmetric padding and GroupNorm from the experimental implementation and should not be considered strictly causal.
+The temporal module uses convolutions with symmetric padding and GroupNorm and is not strictly causal.
 
 ```text
 dwd_code/
@@ -55,7 +55,7 @@ dwd_code/
 
 ## 2. Environment Setup
 
-Run the following commands from the repository root. The base environment is inherited from Cosmos: Linux x86-64, Python 3.10, CUDA 12.8, and PyTorch 2.7.1. See the [environment guide](docs/setup.md) for GPU wheel and driver requirements. GPU memory requirements for ×4 training have not yet been measured.
+Run the following commands from the repository root. The base environment uses Linux x86-64, Python 3.10, CUDA 12.8, and PyTorch 2.7.1. See the [environment guide](docs/setup.md) for GPU wheel and driver requirements. GPU memory requirements for ×4 training have not yet been measured.
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run:
 
@@ -69,7 +69,7 @@ python -c 'import torch; print(torch.__version__, torch.cuda.is_available(), tor
 python -c 'from transformers import DINOv3ViTModel, DINOv3ViTImageProcessorFast'
 ```
 
-**Environment validation status:** The inherited `uv.lock` pins Transformers 4.51.3, which does not include DINOv3, so the additional dependencies in `requirements-dwd.txt` are required. Do not run `uv sync --frozen` again after installing them, as it would restore the pinned versions. A DwD dependency lock validated through full GPU training is not yet available.
+**Environment validation status:** Install both the base dependencies in `uv.lock` and the DINOv3 dependencies in `requirements-dwd.txt`. The lock file pins Transformers 4.51.3; the second installation step provides a version with DINOv3 support. Do not run `uv sync --frozen` again after installing them, as it would restore the pinned versions. A DwD dependency lock validated through full GPU training is not yet available.
 
 ## 3. Model Weights and Paths
 
@@ -87,7 +87,6 @@ hf download nvidia/Cosmos-Reason1-7B \
   --local-dir model_hubs/nvidia/Cosmos-Reason1-7B
 ```
 
-
 [Cosmos-Reason1-7B](https://huggingface.co/nvidia/Cosmos-Reason1-7B) supplies the text embeddings used to condition the Cosmos video model. The models have separate roles in this workflow:
 
 | Model | Role |
@@ -100,7 +99,6 @@ hf download nvidia/Cosmos-Reason1-7B \
 The caption pipeline is `video → Qwen3-VL → trimmed caption → Cosmos-Reason1-7B → text embeddings`. Qwen3-VL produces the caption text; its hidden features cannot be substituted directly for the Cosmos text embeddings.
 
 For preprocessing, `scripts/get_cr1_embeddings.py` loads Cosmos-Reason1-7B and saves the caption embeddings. Default training reads these cached embeddings with `text_encoder_config.compute_online=False`, so it does not load the 7B text encoder during training. This also applies to `--feature-mode online`, which controls DINO feature extraction only. The provided inference script sets `text_encoder_config.compute_online=True` and therefore needs the Cosmos-Reason1-7B weights to encode new prompts.
-
 
 Prepare the following local files. Place `model_hubs` in the repository root to use the default inference script:
 
@@ -120,7 +118,7 @@ checkpoints/
 
 ### Base Model: Exact Checkpoint
 
-`checkpoints/base_model.pt` is a local filename used in this guide for the **Cosmos-Predict2.5-2B base/post-trained BF16 EMA checkpoint**. DwD adapts the Cosmos-Transfer2.5 code and initializes its generative backbone from this Predict2.5 checkpoint. The filename `base_model.pt` is an alias, not an official NVIDIA artifact name.
+`checkpoints/base_model.pt` is a local filename used in this guide for the **Cosmos-Predict2.5-2B base/post-trained BF16 EMA checkpoint**. DwD initializes its generative backbone from this Predict2.5 checkpoint. The filename `base_model.pt` is an alias, not an official NVIDIA artifact name.
 
 | Field | Value |
 | --- | --- |
@@ -129,7 +127,7 @@ checkpoints/
 | Exact weight file | [81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt](https://huggingface.co/nvidia/Cosmos-Predict2.5-2B/blob/15a82a2ec231bc318692aa0456a36537c806e7d4/base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt) |
 | Pinned repository revision | `15a82a2ec231bc318692aa0456a36537c806e7d4` |
 
-This matches the checkpoint path in DwD's inherited [training configuration](cosmos_transfer2/_src/transfer2/configs/vid2vid_transfer/experiment/exp_large_scale.py) and the filename and revision in [NVIDIA's checkpoint registry](https://github.com/nvidia-cosmos/cosmos-predict2.5/blob/main/packages/cosmos-oss/cosmos_oss/checkpoints_predict2.py). The required initialization checkpoint is the Predict2.5 **post-trained** variant; the separately released Transfer2.5 control checkpoints and other Predict2.5 variants are different artifacts.
+This matches the checkpoint path in DwD's [training configuration](cosmos_transfer2/_src/transfer2/configs/vid2vid_transfer/experiment/exp_large_scale.py) and the filename and revision in [NVIDIA's checkpoint registry](https://github.com/nvidia-cosmos/cosmos-predict2.5/blob/main/packages/cosmos-oss/cosmos_oss/checkpoints_predict2.py). The required initialization checkpoint is the Predict2.5 **post-trained** variant; the separately released Transfer2.5 control checkpoints and other Predict2.5 variants are different artifacts.
 
 Download the exact file from the repository root and create the local alias used below. If Hugging Face requests authentication or access approval, complete it on the model page and run `hf auth login` first.
 
@@ -189,7 +187,7 @@ The value `12` above is only an example; use the frame rate determined from the 
 
 Generate English captions with [scripts/qwen_caption.py](scripts/qwen_caption.py), using `Qwen/Qwen3-VL-32B-Instruct` by default. The script samples video frames at 1 FPS, generates a scene description, and postprocesses it to approximately 200 words before text embedding extraction.
 
-Run caption generation in a separate environment because vLLM has its own PyTorch dependencies. The [official Qwen3-VL guide](https://github.com/QwenLM/Qwen3-VL#deployment) specifies vLLM ≥ 0.11.0, Transformers ≥ 4.57.0, and the updated video utilities. The following environment is separate from the DwD training environment and has not yet been validated end to end here:
+Run caption generation in a separate environment because vLLM has its own PyTorch dependencies. The [official Qwen3-VL guide](https://github.com/QwenLM/Qwen3-VL#deployment) specifies vLLM ≥ 0.11.0, Transformers ≥ 4.57.0, and `qwen-vl-utils==0.0.14`. The following environment is separate from the DwD training environment and has not yet been validated end to end here:
 
 ```bash
 uv venv --python 3.10 .venv-caption
@@ -219,7 +217,7 @@ python -m scripts.get_cr1_embeddings \
   --num_workers 1
 ```
 
-Outputs are saved to `cosmos_reason_xxl/<stem>.safetensors` under the key `text_embedding`. The training dataset also supports legacy `.pkl` text embeddings.
+Outputs are saved to `cosmos_reason_xxl/<stem>.safetensors` under the key `text_embedding`.
 
 ### 4.3 Fit PCA
 
@@ -281,7 +279,7 @@ python -m scripts.train_dwd \
   --gpus 8 --max-iter 10000 --checkpoint-every 1000 --seed 0
 ```
 
-The main configuration is in [dwd.py](cosmos_transfer2/_src/transfer2/configs/vid2vid_transfer/experiment/dwd.py). Training uses the existing base model and control branch implementation, freezing the base network and training the control modules. Tail Drop randomly selects the number of retained channels for each sample and zeros the remaining channels; tensors still contain 32 channels.
+The main configuration is in [dwd.py](cosmos_transfer2/_src/transfer2/configs/vid2vid_transfer/experiment/dwd.py). Training freezes the generative backbone and optimizes the control modules. Tail Drop randomly selects the number of retained channels for each sample and zeros the remaining channels; tensors still contain 32 channels.
 
 ### 5.3 Train with Online Features
 
