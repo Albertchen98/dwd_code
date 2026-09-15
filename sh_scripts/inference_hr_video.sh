@@ -20,7 +20,7 @@ if [[ ! "$num_gpus" =~ ^[1-9][0-9]*$ ]] || ((24 % num_gpus != 0)); then
     echo "NUM_GPUS must be a positive divisor of 24." >&2
     exit 2
 fi
-case "$channels" in 4|8|12|16|20|24|28|32) ;; *) echo "PCA_CHANNELS must be 4,8,...,32." >&2; exit 2 ;; esac
+case "$channels" in 3|8|12|16|20|24|28|32) ;; *) echo "PCA_CHANNELS must be 3,8,12,16,20,24,28,32." >&2; exit 2 ;; esac
 case "$input_mode" in
     video) inputs=(--video_path "$2" --input_control_video_path_dino "$3" --prompt_path "$4") ;;
     folder) inputs=(--video_folder "$2" --input_control_folder_dino "$3" --prompt_folder "$4") ;;

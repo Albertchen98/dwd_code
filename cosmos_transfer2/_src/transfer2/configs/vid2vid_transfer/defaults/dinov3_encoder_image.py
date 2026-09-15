@@ -39,7 +39,7 @@ from PIL import Image
 INTERMEDIATE_LAYER_INDEX_DINOV3L16 = [4, 11, 17, 23]  # Use the last layer by default
 HEIGHT=704
 WIDTH=1280
-ALTERNATIVE_CHANNEL=[4, 8, 12, 16, 20, 24, 28, 32]
+ALTERNATIVE_CHANNEL=[3, 8, 12, 16, 20, 24, 28, 32]
 
 def match_distribution(h, h_vit, eps=1e-6):
     """

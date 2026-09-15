@@ -26,7 +26,7 @@ Transform simulated driving videos into realistic videos using DINOv3 features a
 | Feature encoder | Frozen DINOv3 ViT-L/16, final-layer features[^encoder-size] |
 | DINO input resolution | 2816 × 5120, with both height and width scaled by ×4 |
 | PCA | 32 components, centered using the training-set mean, without whitening |
-| Random Channel Tail Drop | Randomly retain the first 4, 8, …, 32 channels and zero the rest |
+| Random Channel Tail Drop | Randomly retain the first 3, 8, 12, 16, 20, 24, 28, or 32 channels and zero the rest |
 | Temporal downsampling | Prepend 3 zero frames; temporal convolutions reduce 96 frames to 24 |
 | Training mode | Offline DINO features; online extraction is optional |
 | Resources and schedule | Single node with 8 GPUs, 10,000 iterations, checkpoint every 1,000 iterations |

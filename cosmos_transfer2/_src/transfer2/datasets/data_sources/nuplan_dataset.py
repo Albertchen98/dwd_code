@@ -35,7 +35,7 @@ from cosmos_transfer2._src.transfer2.datasets.augmentors.blur import Blur
 from torchvision.transforms import v2
 from transformers.image_utils import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 import random
-ALTERNATIVE_CHANNEL=[4, 8, 12, 16, 20, 24, 28, 32]
+ALTERNATIVE_CHANNEL=[3, 8, 12, 16, 20, 24, 28, 32]
 
 """
 Test the dataset with the following command:

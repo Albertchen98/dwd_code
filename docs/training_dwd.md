@@ -15,7 +15,7 @@ archive is included in this code update.
 | DINO input size | 2816 × 5120 (height and width each ×4) |
 | Feature grid | 176 × 320 per frame |
 | PCA | 32 components, global training-set mean, no whitening |
-| Random Channel Tail Drop | Uniformly retain the first k channels, k ∈ {4,8,12,16,20,24,28,32}; zero the remainder |
+| Random Channel Tail Drop | Uniformly retain the first k channels, k ∈ {3,8,12,16,20,24,28,32}; zero the remainder |
 | Temporal adapter | Prepend 3 zero feature frames; convolutional temporal downsampling ×4 (96 → 24 frames) |
 | Spatial adapter | Convolutional downsampling ×4 (176×320 → 44×80) |
 | Optimization | Existing Cosmos control-branch training, 10,000 iterations, checkpoint every 1,000 iterations |
