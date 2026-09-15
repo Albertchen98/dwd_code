@@ -7,7 +7,7 @@
   <a href="https://albertchen98.github.io/DwD-project/"><img src="https://img.shields.io/badge/Project-Page-2563EB?logo=github&amp;logoColor=white" alt="Project page"></a>
 </p>
 
-> **Note:** This code has not yet been validated through end-to-end training, as I currently do not have access to a GPU cluster. If you have any questions or encounter issues, please [open an issue](https://github.com/Albertchen98/dwd_code/issues). I'll do my best to respond promptly.
+> **Note:** I have tested the training-related API interfaces as thoroughly as possible in the available CPU environment, including configuration composition, launcher arguments, DINO encoder calls, and dataset interfaces. These checks cover selected components rather than the full training stack. End-to-end GPU training has not yet been validated, as I currently do not have access to a GPU cluster. If you have any questions or encounter issues, please [open an issue](https://github.com/Albertchen98/dwd_code/issues). I'll do my best to respond promptly.
 
 Transform simulated driving videos into realistic videos using DINOv3 features as conditioning. This repository provides training, data preprocessing, and inference code built on [NVIDIA Cosmos-Transfer2.5](https://github.com/nvidia-cosmos/cosmos-transfer2.5), with Cosmos-Predict2.5-2B as the generative backbone.
 
@@ -33,7 +33,7 @@ Transform simulated driving videos into realistic videos using DINOv3 features a
 
 [^encoder-size]: We expect smaller DINOv3 backbones, such as ViT-S/16 and ViT-S+/16, to be viable alternatives for this approach. Unfortunately, limited compute resources prevented us from conducting further backbone-size ablations. We also hypothesize that smaller backbones may produce feature maps with a smaller sim-to-real gap, but this remains unverified. As a related example, [Control-DINO: Feature Space Conditioning for Controllable Image-to-Video Diffusion](https://arxiv.org/html/2604.01761v1#S4.SS2) uses DINOv3 ViT-S/16. Its use of a small backbone does not establish the gap hypothesis. Exploring these alternatives requires adapting the encoder configuration and fitting the corresponding PCA basis; the current configuration targets ViT-L/16.
 
-**The ×4 scaling applies only to the DINO encoder input; it does not change the generated video resolution.** DINOv3 uses its pretrained LayerNorm, including the learned scale and bias. Input images use ImageNet normalization. Feature L2 normalization is disabled by default.
+**The ×4 scaling applies only to the DINO encoder input; it does not change the generated video resolution.** DINOv3 uses its pretrained LayerNorm, including the learned scale and bias. Input images use ImageNet normalization.
 
 The temporal module uses convolutions with symmetric padding and GroupNorm and is not strictly causal.
 
@@ -370,5 +370,10 @@ Filename stems must match across the three input directories. Folder mode proces
 ## 7. Validation and Release Status
 
 The training entry point and key tensor operations have undergone static and CPU checks. End-to-end training and inference with real data, official checkpoints, and multiple GPUs have not yet been validated. A fully reproducible release still requires a validated environment lock, base and project weights with checksums, the paper's data splits and caption manifests, and CarlaData30hr download information. This implementation does not yet claim reproduction of the paper's metrics.
+
+### TODO
+
+- [ ] Release inference code for the **PCA-8 configuration without DINO input upsampling (×1)**.
+- [ ] Release the corresponding trained weights and PCA basis, with download links and inference instructions.
 
 This code is based on NVIDIA Cosmos and retains upstream copyright notices. See [ATTRIBUTIONS.md](ATTRIBUTIONS.md) and [LICENSE](LICENSE) for third-party attribution and licensing.
