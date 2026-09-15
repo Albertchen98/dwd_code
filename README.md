@@ -23,13 +23,15 @@ Transform simulated driving videos into realistic videos using DINOv3 features a
 | --- | --- |
 | Real training data | nuPlan front-view videos |
 | Training video | 93 consecutive frames, 704 × 1280 |
-| Feature encoder | Frozen DINOv3 ViT-L/16, final-layer features |
+| Feature encoder | Frozen DINOv3 ViT-L/16, final-layer features[^encoder-size] |
 | DINO input resolution | 2816 × 5120, with both height and width scaled by ×4 |
 | PCA | 32 components, centered using the training-set mean, without whitening |
 | Random Channel Tail Drop | Randomly retain the first 4, 8, …, 32 channels and zero the rest |
 | Temporal downsampling | Prepend 3 zero frames; temporal convolutions reduce 96 frames to 24 |
 | Training mode | Offline DINO features; online extraction is optional |
 | Resources and schedule | Single node with 8 GPUs, 10,000 iterations, checkpoint every 1,000 iterations |
+
+[^encoder-size]: We expect smaller DINOv3 backbones, such as ViT-S/16 and ViT-S+/16, to be viable alternatives for this approach. Unfortunately, limited compute resources prevented us from conducting further backbone-size ablations. We also hypothesize that smaller backbones may produce feature maps with a smaller sim-to-real gap, but this remains unverified. As a related example, [Control-DINO: Feature Space Conditioning for Controllable Image-to-Video Diffusion](https://arxiv.org/html/2604.01761v1#S4.SS2) uses DINOv3 ViT-S/16. Its use of a small backbone does not establish the gap hypothesis. Exploring these alternatives requires adapting the encoder configuration and fitting the corresponding PCA basis; the current configuration targets ViT-L/16.
 
 **The ×4 scaling applies only to the DINO encoder input; it does not change the generated video resolution.** DINOv3 uses its pretrained LayerNorm, including the learned scale and bias. Input images use ImageNet normalization. Feature L2 normalization is disabled by default.
 
